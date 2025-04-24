@@ -1,168 +1,151 @@
-#define CUSTOM_SETTINGS
-#define INCLUDE_GAMEPAD_MODULE
-#include <DabbleESP32.h>
+#include <ESP8266WiFi.h>
+#include <espnow.h>
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 
-// LCD Setup (ESP32-compatible library)
+// I2C LCD setup - address may need adjustment
 LiquidCrystal_I2C lcd(0x27, 16, 2);
 
-// Ultrasonic Sensors
-#define FRONT_TRIG 13
-#define FRONT_ECHO 12
-#define BACK_TRIG 14
-#define BACK_ECHO 27
+// Motor control pins (4 pins only)
+#define LEFT_MOTOR_IN1 5   // D1 (GPIO5)
+#define LEFT_MOTOR_IN2 4   // D2 (GPIO4)
+#define RIGHT_MOTOR_IN3 0  // D3 (GPIO0)
+#define RIGHT_MOTOR_IN4 2  // D4 (GPIO2)
 
-// Motor Control Pins
-#define LEFT_IN1 17
-#define LEFT_IN2 16
-#define LEFT_ENA 5
-#define RIGHT_IN3 18
-#define RIGHT_IN4 19
-#define RIGHT_ENB 4
+// Define the structure for receiving data
+typedef struct control_message {
+  int x;
+  int y;
+  bool button;
+} control_message;
 
-// PWM Settings
-const int PWM_FREQ = 1000;
-const int PWM_RES = 8;
-const int LEFT_CH = 0;
-const int RIGHT_CH = 1;
+// Create an instance of the structure
+control_message controlData;
 
-// Global Variables
-bool dangerMode = false;
-float frontDistance = 0;
-float backDistance = 0;
-float speedMultiplier = 0.5;  // 50% speed (0.0 to 1.0)
+// Flag for connection status
+bool isConnected = false;
+unsigned long lastReceivedTime = 0;
+const unsigned long CONNECTION_TIMEOUT = 3000; // 3 seconds timeout
 
 void setup() {
   Serial.begin(115200);
   
-  // LCD Initialization
+  // Initialize I2C LCD
+  Wire.begin(4, 5); // SDA=D2(GPIO4), SCL=D1(GPIO5)
   lcd.init();
   lcd.backlight();
   lcd.clear();
-  
-  // Ultrasonic Sensors
-  pinMode(FRONT_TRIG, OUTPUT);
-  pinMode(FRONT_ECHO, INPUT);
-  pinMode(BACK_TRIG, OUTPUT);
-  pinMode(BACK_ECHO, INPUT);
-
-  // Motor Control Setup
-  pinMode(LEFT_IN1, OUTPUT);
-  pinMode(LEFT_IN2, OUTPUT);
-  pinMode(RIGHT_IN3, OUTPUT);
-  pinMode(RIGHT_IN4, OUTPUT);
-  
-  ledcSetup(LEFT_CH, PWM_FREQ, PWM_RES);
-  ledcAttachPin(LEFT_ENA, LEFT_CH);
-  ledcSetup(RIGHT_CH, PWM_FREQ, PWM_RES);
-  ledcAttachPin(RIGHT_ENB, RIGHT_CH);
-
-  Dabble.begin("ESP32-Car");
-}
-
-float measureDistance(int trigPin, int echoPin) {
-  digitalWrite(trigPin, LOW);
-  delayMicroseconds(2);
-  digitalWrite(trigPin, HIGH);
-  delayMicroseconds(10);
-  digitalWrite(trigPin, LOW);
-  
-  long duration = pulseIn(echoPin, HIGH);
-  return duration * 0.034 / 2;
-}
-
-void updateLCD() {
-  lcd.clear();
   lcd.setCursor(0, 0);
-
-  // Front distance display
-  lcd.print("F:");
-  if (frontDistance > 200) {
-    lcd.print("max");
-  } else if (frontDistance < 5) {
-    lcd.print("min");
-  } else {
-    lcd.print(frontDistance, 0); // 0 decimals
-    lcd.print("cm");
-  }
-
-  lcd.print(" B:");
-
-  // Back distance display
-  if (backDistance > 200) {
-    lcd.print("max");
-  } else if (backDistance < 5) {
-    lcd.print("min");
-  } else {
-    lcd.print(backDistance, 0); // 0 decimals
-    lcd.print("cm");
-  }
-
+  lcd.print("Waiting for");
   lcd.setCursor(0, 1);
-  lcd.print("Mode: ");
-  lcd.print(dangerMode ? "DANGER" : "SAFE  ");
-}
-
-void setMotor(int in1, int in2, int pwmChannel, int speed) {
-  int pwm = map(abs(speed), 0, 100, 0, 255);
+  lcd.print("connection...");
   
-  if (speed > 0) {
-    digitalWrite(in1, HIGH);
-    digitalWrite(in2, LOW);
-    ledcWrite(pwmChannel, pwm);
-  } else if (speed < 0) {
-    digitalWrite(in1, LOW);
-    digitalWrite(in2, HIGH);
-    ledcWrite(pwmChannel, pwm);
-  } else {
-    digitalWrite(in1, LOW);
-    digitalWrite(in2, LOW);
-    ledcWrite(pwmChannel, 0);
+  // Configure motor pins
+  pinMode(LEFT_MOTOR_IN1, OUTPUT);
+  pinMode(LEFT_MOTOR_IN2, OUTPUT);
+  pinMode(RIGHT_MOTOR_IN3, OUTPUT);
+  pinMode(RIGHT_MOTOR_IN4, OUTPUT);
+  
+  // Stop motors initially
+  digitalWrite(LEFT_MOTOR_IN1, LOW);
+  digitalWrite(LEFT_MOTOR_IN2, LOW);
+  digitalWrite(RIGHT_MOTOR_IN3, LOW);
+  digitalWrite(RIGHT_MOTOR_IN4, LOW);
+  
+  // Set device as a Wi-Fi Station
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+
+  // Print MAC address for pairing
+  Serial.print("Receiver MAC Address: ");
+  Serial.println(WiFi.macAddress());
+
+  // Initialize ESP-NOW
+  if (esp_now_init() != 0) {
+    Serial.println("Error initializing ESP-NOW");
+    return;
   }
+  
+  // Set ESP-NOW Role
+  esp_now_set_self_role(ESP_NOW_ROLE_SLAVE);
+  
+  // Register callback function for incoming data
+  esp_now_register_recv_cb(OnDataRecv);
 }
 
 void loop() {
-  Dabble.processInput();
-  
-  // Measure distances
-  frontDistance = measureDistance(FRONT_TRIG, FRONT_ECHO);
-  backDistance = measureDistance(BACK_TRIG, BACK_ECHO);
-  
-  // Update LCD every 500ms
-  static unsigned long lastLCDUpdate = 0;
-  if (millis() - lastLCDUpdate > 500) {
-    updateLCD();
-    lastLCDUpdate = millis();
-  }
-
-  // Handle Danger Mode Toggle
-  if (GamePad.isCrossPressed()) dangerMode = true;
-  if (GamePad.isCirclePressed()) dangerMode = false;
-
-  if (Dabble.isAppConnected()) {
-    int x = GamePad.getXaxisData();
-    int y = -GamePad.getYaxisData();  // Invert Y-axis
+  // Check connection status
+  if (millis() - lastReceivedTime > CONNECTION_TIMEOUT && isConnected) {
+    isConnected = false;
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Disconnected!");
+    lcd.setCursor(0, 1);
+    lcd.print("Waiting...");
     
-    // Safety checks
-    bool blockFront = (backDistance < 50) && !dangerMode;
-    bool blockBack = (frontDistance < 50) && !dangerMode;
-    bool blockRotation = (frontDistance < 25 || backDistance < 25) && !dangerMode;
-
-    // Apply movement restrictions
-    if (blockFront && y > 0) y = 0;
-    if (blockBack && y < 0) y = 0;
-    if (blockRotation && x != 0) x = 0;
-
-    // Calculate motor speeds
-int leftSpeed = constrain((y + x) * speedMultiplier, -100, 100);
-int rightSpeed = constrain((y - x) * speedMultiplier, -100, 100);
-
-    // Set motors
-    setMotor(LEFT_IN1, LEFT_IN2, LEFT_CH, leftSpeed);
-    setMotor(RIGHT_IN3, RIGHT_IN4, RIGHT_CH, rightSpeed);
-  } else {
-    setMotor(LEFT_IN1, LEFT_IN2, LEFT_CH, 0);
-    setMotor(RIGHT_IN3, RIGHT_IN4, RIGHT_CH, 0);
+    // Stop motors when connection lost
+    stopMotors();
   }
+}
+
+// Callback when data is received
+void OnDataRecv(uint8_t *mac, uint8_t *incomingData, uint8_t len) {
+  lastReceivedTime = millis();
+  
+  if (!isConnected) {
+    isConnected = true;
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Connected!");
+    lcd.setCursor(0, 1);
+    lcd.print("Receiving data...");
+  }
+  
+  // Copy incoming data to structure
+  memcpy(&controlData, incomingData, sizeof(controlData));
+  
+  // Process the joystick data
+  controlCar(controlData.x, controlData.y);
+}
+
+// Function to control car movement based on joystick input
+void controlCar(int x, int y) {
+  // PWM values for speed control
+  int leftSpeed = y + x;   // Left = forward + turn
+  int rightSpeed = y - x;  // Right = forward - turn
+  
+  // Constrain speeds to -100 to 100 range
+  leftSpeed = constrain(leftSpeed, -100, 100);
+  rightSpeed = constrain(rightSpeed, -100, 100);
+  
+  // Left motor direction control
+  if (leftSpeed > 0) {
+    analogWrite(LEFT_MOTOR_IN1, leftSpeed * 2.55); // Scale to 0-255
+    digitalWrite(LEFT_MOTOR_IN2, LOW);
+  } else if (leftSpeed < 0) {
+    digitalWrite(LEFT_MOTOR_IN1, LOW);
+    analogWrite(LEFT_MOTOR_IN2, abs(leftSpeed) * 2.55);
+  } else {
+    digitalWrite(LEFT_MOTOR_IN1, LOW);
+    digitalWrite(LEFT_MOTOR_IN2, LOW);
+  }
+  
+  // Right motor direction control
+  if (rightSpeed > 0) {
+    analogWrite(RIGHT_MOTOR_IN3, rightSpeed * 2.55);
+    digitalWrite(RIGHT_MOTOR_IN4, LOW);
+  } else if (rightSpeed < 0) {
+    digitalWrite(RIGHT_MOTOR_IN3, LOW);
+    analogWrite(RIGHT_MOTOR_IN4, abs(rightSpeed) * 2.55);
+  } else {
+    digitalWrite(RIGHT_MOTOR_IN3, LOW);
+    digitalWrite(RIGHT_MOTOR_IN4, LOW);
+  }
+}
+
+void stopMotors() {
+  digitalWrite(LEFT_MOTOR_IN1, LOW);
+  digitalWrite(LEFT_MOTOR_IN2, LOW);
+  digitalWrite(RIGHT_MOTOR_IN3, LOW);
+  digitalWrite(RIGHT_MOTOR_IN4, LOW);
 }
